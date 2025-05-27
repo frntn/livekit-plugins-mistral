@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import json 
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 
 # pip install mistralai
 from mistralai import Mistral # Updated import
@@ -93,9 +93,15 @@ from .log import logger
 from .models import ChatModels
 
 
+class AgentError(LLMError):
+    """Agent-specific errors with descriptive prefixes"""
+    pass
+
+
 @dataclass
 class _LLMOptions:
     model: str | ChatModels
+    mode: Literal["normal", "agent"] = field(default="normal")
     temperature: NotGivenOr[float] = field(default=NOT_GIVEN)
     tool_choice: NotGivenOr[LiveKitToolChoice] = field(default=NOT_GIVEN) 
     max_tokens: NotGivenOr[int] = field(default=NOT_GIVEN)
@@ -109,6 +115,7 @@ class LLM(llm.LLM):
         self,
         *,
         model: str | ChatModels = "mistral-small-latest",
+        mode: Literal["normal", "agent"] = "normal",
         api_key: NotGivenOr[str] = NOT_GIVEN,
         base_url: NotGivenOr[str] = NOT_GIVEN, 
         client: Mistral | None = None, # Updated type hint
@@ -122,6 +129,7 @@ class LLM(llm.LLM):
         super().__init__()
         self._opts = _LLMOptions(
             model=model,
+            mode=mode,
             temperature=temperature,
             tool_choice=tool_choice,
             max_tokens=max_tokens,
@@ -145,6 +153,47 @@ class LLM(llm.LLM):
             self._client = client or Mistral(api_key=_api_key)
 
     def chat(
+        self,
+        *,
+        chat_ctx: ChatContext,
+        tools: list[FunctionTool] | None = None,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS, 
+        tool_choice: NotGivenOr[LiveKitToolChoice] = NOT_GIVEN, 
+        temperature: NotGivenOr[float] = NOT_GIVEN,
+        max_tokens: NotGivenOr[int] = NOT_GIVEN,
+        top_p: NotGivenOr[float] = NOT_GIVEN,
+        random_seed: NotGivenOr[int] = NOT_GIVEN,
+        safe_prompt: NotGivenOr[bool] = NOT_GIVEN,
+        **kwargs, 
+    ) -> LLMStream:
+        if self._opts.mode == "normal":
+            return self._chat_normal(
+                chat_ctx=chat_ctx,
+                tools=tools,
+                conn_options=conn_options,
+                tool_choice=tool_choice,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                random_seed=random_seed,
+                safe_prompt=safe_prompt,
+                **kwargs
+            )
+        else:  # mode == "agent"
+            return self._chat_agent(
+                chat_ctx=chat_ctx,
+                tools=tools,
+                conn_options=conn_options,
+                tool_choice=tool_choice,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                random_seed=random_seed,
+                safe_prompt=safe_prompt,
+                **kwargs
+            )
+
+    def _chat_normal(
         self,
         *,
         chat_ctx: ChatContext,
@@ -263,6 +312,85 @@ class LLM(llm.LLM):
             tools=tools or [],
             conn_options=conn_options,
         )
+
+    def _chat_agent(
+        self,
+        *,
+        chat_ctx: ChatContext,
+        tools: list[FunctionTool] | None = None,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS, 
+        tool_choice: NotGivenOr[LiveKitToolChoice] = NOT_GIVEN, 
+        temperature: NotGivenOr[float] = NOT_GIVEN,
+        max_tokens: NotGivenOr[int] = NOT_GIVEN,
+        top_p: NotGivenOr[float] = NOT_GIVEN,
+        random_seed: NotGivenOr[int] = NOT_GIVEN,
+        safe_prompt: NotGivenOr[bool] = NOT_GIVEN,
+        **kwargs, 
+    ) -> LLMStream:
+        try:
+            # Convert ChatContext to agent conversation inputs
+            agent_inputs = []
+            for item in chat_ctx.items:
+                if item.type == "message":
+                    role = item.role
+                    if role == "developer": 
+                        role = "system"
+                    # Skip function_call_output for agent mode - let agent handle tools internally
+                    elif role == "function_call_output":
+                        continue
+                    
+                    content_str = item.text_content or ""
+                    agent_inputs.append({"role": role, "content": content_str})
+                # Skip function_call items for agent mode - let agent handle tools internally
+                elif item.type == "function_call":
+                    continue
+
+            # Get completion parameters
+            _temperature = temperature if is_given(temperature) else self._opts.temperature
+            _max_tokens = max_tokens if is_given(max_tokens) else self._opts.max_tokens
+            _top_p = top_p if is_given(top_p) else self._opts.top_p
+            _random_seed = random_seed if is_given(random_seed) else self._opts.random_seed
+            _safe_prompt = safe_prompt if is_given(safe_prompt) else self._opts.safe_prompt
+
+            final_temperature = _temperature if is_given(_temperature) else None
+            final_max_tokens = _max_tokens if is_given(_max_tokens) else None
+            final_top_p = _top_p if is_given(_top_p) else None
+            final_random_seed = _random_seed if is_given(_random_seed) else None
+            final_safe_prompt = _safe_prompt if is_given(_safe_prompt) else False
+
+            # Build completion_args for agent API
+            completion_args = {}
+            if final_temperature is not None:
+                completion_args["temperature"] = final_temperature
+            if final_max_tokens is not None:
+                completion_args["max_tokens"] = final_max_tokens
+            if final_top_p is not None:
+                completion_args["top_p"] = final_top_p
+            if final_random_seed is not None:
+                completion_args["random_seed"] = final_random_seed
+            if final_safe_prompt is not None:
+                completion_args["safe_prompt"] = final_safe_prompt
+
+            # Use agent API - always start new conversation (stateless like normal mode)
+            mistral_stream = self._client.beta.conversations.start_stream(
+                agent_id=self._opts.model,  # agent_id instead of model
+                inputs=agent_inputs,        # Full conversation history
+                store=False,               # Don't store server-side (stateless)
+                completion_args=completion_args if completion_args else None,
+                **kwargs
+            )
+
+            return LLMStream(
+                self,
+                mistral_stream=mistral_stream, # type: ignore
+                chat_ctx=chat_ctx, 
+                tools=tools or [],
+                conn_options=conn_options,
+            )
+
+        except Exception as e:
+            logger.error(f"Error during Mistral Agent stream: {e}", exc_info=e)
+            raise AgentError(f"AgentError: {str(e)}") from e
 
 
 class LLMStream(llm.LLMStream):

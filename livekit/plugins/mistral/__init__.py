@@ -16,7 +16,7 @@
 Supports Large Language Models (LLMs) with Mistral AI.
 """
 
-from .llm import LLM, LLMStream
+from .llm import LLM, LLMStream, AgentError
 from .log import logger
 from .models import ChatModels 
 from .version import __version__
@@ -24,6 +24,7 @@ from .version import __version__
 __all__ = [
     "LLM",
     "LLMStream",
+    "AgentError",
     "ChatModels",
     "logger",
     "__version__",
